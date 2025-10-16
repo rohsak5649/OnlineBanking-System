@@ -7,6 +7,8 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <sstream>
+#include <algorithm>
 
 using namespace std;
 
@@ -68,13 +70,129 @@ void log_event(MYSQL* conn, const string &etype, const string &message, int cust
     executeQuery(conn, q);
 }
 
-/* ========== CUSTOMER FEATURES ========== */
+/* ========== TRANSACTIONS & UTIL ========== */
 
 void insert_transaction(MYSQL* conn, int customerId, const string &type, double amount, const string &desc) {
     string q = "INSERT INTO transactions (customer_id, type, amount, description) VALUES (";
     q += to_string(customerId) + ", '" + escape_string(conn, type) + "', " + to_string(amount) + ", '" + escape_string(conn, desc) + "')";
     executeQuery(conn, q);
 }
+
+double get_customer_balance(MYSQL* conn, int customerId) {
+    string q = "SELECT balance FROM customers WHERE id = " + to_string(customerId);
+    if (mysql_query(conn, q.c_str()) != 0) return -1;
+    MYSQL_RES* res = mysql_store_result(conn);
+    MYSQL_ROW row = res ? mysql_fetch_row(res) : nullptr;
+    double bal = row ? stod(row[0]) : -1;
+    if (res) mysql_free_result(res);
+    return bal;
+}
+
+/* ========== LUHN ALGO & CARD GENERATION ========== */
+
+// Compute Luhn check digit for numeric string (without check digit)
+int luhn_compute_check_digit(const string &num_no_check) {
+    int sum = 0;
+    bool double_it = true; // we will process from right to left, doubling every second digit
+    // Start from rightmost digit of num_no_check
+    for (int i = (int)num_no_check.size() - 1; i >= 0; --i) {
+        int d = num_no_check[i] - '0';
+        if (double_it) {
+            d = d * 2;
+            if (d > 9) d -= 9;
+        }
+        sum += d;
+        double_it = !double_it;
+    }
+    int check = (10 - (sum % 10)) % 10;
+    return check;
+}
+
+// Luhn full validation
+bool luhn_validate(const string &full_number) {
+    if (full_number.empty()) return false;
+    int sum = 0;
+    bool double_it = false; // check digit is last (rightmost) so start doubling from second-last
+    for (int i = (int)full_number.size() - 1; i >= 0; --i) {
+        int d = full_number[i] - '0';
+        if (double_it) {
+            d = d * 2;
+            if (d > 9) d -= 9;
+        }
+        sum += d;
+        double_it = !double_it;
+    }
+    return (sum % 10) == 0;
+}
+
+// Check if card number exists in DB (either pending or approved)
+bool db_card_exists(MYSQL* conn, const string &cardNumber) {
+    string q = "SELECT id FROM credit_cards WHERE card_number = '" + escape_string(conn, cardNumber) + "' LIMIT 1";
+    if (mysql_query(conn, q.c_str()) != 0) return true; // on error assume exists to avoid duplicates
+    MYSQL_RES* r = mysql_store_result(conn);
+    bool exists = false;
+    if (r) {
+        exists = (mysql_num_rows(r) > 0);
+        mysql_free_result(r);
+    }
+    return exists;
+}
+
+// Generate random numeric string of length n
+string rand_numeric_str(int n) {
+    string s;
+    s.reserve(n);
+    for (int i = 0; i < n; ++i) s.push_back(char('0' + (rand() % 10)));
+    return s;
+}
+
+// Given an issuer code, generate a candidate 16-digit card number (all outputs 16 digits to match DB schema)
+string generate_candidate_card(MYSQL* conn, const string &issuer) {
+    // Define BIN/prefix suggestions (you can expand to more precise BIN ranges)
+    string prefix;
+    if (issuer == "Visa") prefix = "4";              // Visa starts with 4
+    else if (issuer == "MasterCard") prefix = "5";   // MasterCard commonly 51-55 or 2221-2720; simplified to '5'
+    else if (issuer == "AmEx") prefix = "37";        // AmEx starts with 34 or 37 -> using 37 (will pad to 16 digits)
+    else if (issuer == "RuPay") prefix = "60";       // example domestic prefix (varies) - using 60
+    else prefix = "9";                               // fallback / other
+
+    const int total_len = 16; // our DB stores 16 chars (if you want to support AmEx 15-digit adjust DB)
+    int body_len = total_len - (int)prefix.size() - 1; // minus check digit
+    if (body_len <= 0) body_len = total_len - 1;
+
+    // Try multiple times to avoid collisions
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        string body = rand_numeric_str(body_len);
+        string without_check = prefix + body;
+        int check = luhn_compute_check_digit(without_check);
+        string card = without_check + char('0' + check);
+        if (!db_card_exists(conn, card)) return card;
+    }
+
+    // If still colliding (very unlikely), fall back to using timestamp-derived randomness and loop until unique
+    int safety = 0;
+    while (safety < 1000) {
+        string body = to_string((unsigned long long)time(nullptr) ^ (unsigned long long)(rand()));
+        // trim or pad to required length
+        if ((int)body.size() < body_len) body += rand_numeric_str(body_len - (int)body.size());
+        if ((int)body.size() > body_len) body = body.substr(0, body_len);
+        string without_check = prefix + body;
+        int check = luhn_compute_check_digit(without_check);
+        string card = without_check + char('0' + check);
+        if (!db_card_exists(conn, card)) return card;
+        ++safety;
+    }
+    return ""; // failed to generate unique number (very unlikely)
+}
+
+string mask_card_number(const string &card) {
+    if (card.size() < 8) return card;
+    string masked = card;
+    for (size_t i = 6; i + 4 < masked.size(); ++i) masked[i] = '*';
+    return masked;
+}
+
+/* ========== CUSTOMER FEATURES ========== */
 
 void createAccount(MYSQL* conn) {
     string name, phone, aadhar, email, pin;
@@ -142,21 +260,43 @@ void createAccount(MYSQL* conn) {
         cout << "Account creation failed.\n";
     }
 }
-
-double get_customer_balance(MYSQL* conn, int customerId) {
-    string q = "SELECT balance FROM customers WHERE id = " + to_string(customerId);
-    if (mysql_query(conn, q.c_str()) != 0) return -1;
+void check_credit_card_interest(MYSQL* conn, int customerId) {
+    string q = "SELECT id, used_amount, last_payment_date FROM credit_cards WHERE customer_id = "
+             + to_string(customerId) + " AND status = 'Approved' AND used_amount > 0";
+    if (mysql_query(conn, q.c_str()) != 0) return;
     MYSQL_RES* res = mysql_store_result(conn);
-    MYSQL_ROW row = res ? mysql_fetch_row(res) : nullptr;
-    double bal = row ? stod(row[0]) : -1;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        int cardId = stoi(row[0]);
+        double used = atof(row[1]);
+        string lastPay = row[2] ? row[2] : "";
+        if (!lastPay.empty()) {
+            string diffQ = "SELECT DATEDIFF(CURDATE(), '" + string(lastPay) + "')";
+            if (mysql_query(conn, diffQ.c_str()) == 0) {
+                MYSQL_RES* dres = mysql_store_result(conn);
+                MYSQL_ROW drow = dres ? mysql_fetch_row(dres) : nullptr;
+                if (drow && atoi(drow[0]) > 45) {
+                    double newAmt = used * 1.16; // add 16% interest
+                    string upd = "UPDATE credit_cards SET used_amount = " + to_string(newAmt)
+                               + " WHERE id = " + to_string(cardId);
+                    executeQuery(conn, upd);
+                    insert_transaction(conn, customerId, "Interest", newAmt - used, "16% interest applied after 45 days");
+                    log_event(conn, "CreditCardInterest", "16% interest applied after 45 days", customerId);
+                    cout << "⚠️  Interest applied on your credit card due to 45+ days delay.\n";
+                }
+                if (dres) mysql_free_result(dres);
+            }
+        }
+    }
     if (res) mysql_free_result(res);
-    return bal;
 }
+
 
 void customerMenu(MYSQL* conn, int customerId) {
     int choice;
     while (true) {
-        cout << "\n===== CUSTOMER MENU =====\n1.Add Money  2.Withdraw  3.Check Balance\n4.Send Money 5.Pay Bills 6.Fund Transfer\n7.Apply Loan 8.Apply Credit Card 9.View Transactions 10.Logout\nChoose: ";
+        cout << "\n===== CUSTOMER MENU =====\n1.Add Money\n2.Withdraw\n3.Check Balance\n4.Send Money\n5.Pay Bills\n6.Fund Transfer\n7.Apply Loan\n8.Apply Credit Card\n9.View Transactions\n10.Use Credit Card \n11.Logout  \nChoose: ";
+
         if (!(cin >> choice)) { cin.clear(); cin.ignore(1024,'\n'); continue; }
 
         if (choice == 1) {
@@ -282,29 +422,63 @@ void customerMenu(MYSQL* conn, int customerId) {
                 log_event(conn, "LoanRequest", "Loan requested", customerId);
             } else cout << "Failed to submit loan request.\n";
         }
-        else if (choice == 8) {
-            int creditScore; double salary;
-            cout << "Credit score: "; cin >> creditScore;
-            cout << "Monthly salary: ₹"; cin >> salary;
-            // check already applied
-            string checkQ = "SELECT id FROM credit_cards WHERE customer_id = " + to_string(customerId);
-            if (mysql_query(conn, checkQ.c_str()) == 0) {
-                MYSQL_RES* r = mysql_store_result(conn);
-                if (r && mysql_num_rows(r) > 0) { cout << "You already applied for a credit card.\n"; mysql_free_result(r); continue; }
-                if (r) mysql_free_result(r);
-            }
-            if (creditScore < 400) { cout << "Not eligible (score < 400).\n"; continue; }
-            double creditLimit = salary * 3.0;
-            // card number generation (pseudo)
-            unsigned long long n = ((unsigned long long)rand() << 32) ^ (unsigned long long)time(nullptr);
-            n = (n % 9000000000000000ULL) + 1000000000000000ULL;
-            string cardNum = to_string(n);
-            string insertQ = "INSERT INTO credit_cards (customer_id, card_number, status, credit_limit, approved_by) VALUES (" + to_string(customerId) + ", '" + cardNum + "', 'Pending', " + to_string(creditLimit) + ", 'A4')";
-            if (executeQuery(conn, insertQ)) {
-                cout << "Credit card request sent to Admin A4. Card number: " << cardNum << " Limit: ₹" << creditLimit << "\n";
-                log_event(conn, "CreditCardApply", "Credit card applied", customerId);
-            } else cout << "Failed to apply for credit card.\n";
+else if (choice == 8) {
+    int creditScore; double salary;
+    cout << "Enter your credit score (300-850): "; cin >> creditScore;
+    cout << "Enter your monthly salary: ₹"; cin >> salary;
+
+    if (creditScore < 400) { cout << "Not eligible (score < 400).\n"; continue; }
+
+    // Check if existing card
+    string checkQ = "SELECT id FROM credit_cards WHERE customer_id = " + to_string(customerId) + " LIMIT 1";
+    if (mysql_query(conn, checkQ.c_str()) == 0) {
+        MYSQL_RES* r = mysql_store_result(conn);
+        if (r && mysql_num_rows(r) > 0) {
+            cout << "You already have or applied for a credit card.\n";
+            if (r) mysql_free_result(r);
+            continue;
         }
+        if (r) mysql_free_result(r);
+    }
+
+    cout << "Choose card issuer:\n1) MasterCard\n2) Visa\n3) Amex\n4) RuPay\nEnter choice [1-4]: ";
+    int issuerChoice; cin >> issuerChoice;
+    string issuer;
+    switch (issuerChoice) {
+        case 1: issuer = "MasterCard"; break;
+        case 2: issuer = "Visa"; break;
+        case 3: issuer = "Amex"; break;
+        case 4: issuer = "RuPay"; break;
+        default: issuer = "Visa"; break;
+    }
+
+    // Determine BIN prefix
+    string prefix;
+    if (issuer == "Visa") prefix = "4";
+    else if (issuer == "MasterCard") prefix = to_string(51 + rand() % 5);
+    else if (issuer == "Amex") prefix = (rand() % 2 ? "34" : "37");
+    else if (issuer == "RuPay") prefix = to_string(60 + rand() % 6);
+    else prefix = "9";
+
+    string candidate = generate_candidate_card(conn, prefix);
+    if (candidate.empty()) { cout << "Error generating card.\n"; continue; }
+
+    double creditLimit = max(1000.0, salary * 3.0);
+    string insertQ =
+        "INSERT INTO credit_cards (customer_id, card_number, issuer, status, credit_limit, used_amount, joining_fee, last_payment_date, request_time) VALUES ("
+        + to_string(customerId) + ", '" + escape_string(conn, candidate) + "', '" + issuer +
+        "', 'Pending', " + to_string(creditLimit) + ", 0.00, 500.00, NULL, NOW())";
+
+    if (executeQuery(conn, insertQ)) {
+        cout << "✅ Credit card request sent to Admin A4.\n";
+        cout << "Proposed Card (masked): " << mask_card_number(candidate) << "\n";
+        cout << "Issuer: " << issuer << " | Limit: ₹" << fixed << setprecision(2) << creditLimit << "\n";
+        log_event(conn, "CreditCardApply", "Credit card applied", customerId);
+    } else {
+        cout << "Failed to submit credit card application.\n";
+    }
+}
+
         else if (choice == 9) {
             string q = "SELECT type, amount, date_time, description FROM transactions WHERE customer_id = " + to_string(customerId) + " ORDER BY date_time DESC";
             if (mysql_query(conn, q.c_str()) == 0) {
@@ -318,6 +492,34 @@ void customerMenu(MYSQL* conn, int customerId) {
             } else cout << "Failed to fetch transactions.\n";
         }
         else if (choice == 10) {
+            check_credit_card_interest(conn, customerId); // apply overdue interest if needed
+            double amount;
+            cout << "Enter purchase amount: ₹"; cin >> amount;
+            if (amount <= 0) { cout << "Invalid.\n"; continue; }
+
+            string q = "SELECT id, used_amount, credit_limit FROM credit_cards WHERE customer_id = "
+                     + to_string(customerId) + " AND status = 'Approved' LIMIT 1";
+            if (mysql_query(conn, q.c_str()) != 0) { cout << "Error fetching card.\n"; continue; }
+            MYSQL_RES* res = mysql_store_result(conn);
+            MYSQL_ROW row = res ? mysql_fetch_row(res) : nullptr;
+            if (!row) { cout << "No approved card found.\n"; if (res) mysql_free_result(res); continue; }
+            int cardId = stoi(row[0]);
+            double used = atof(row[1]), limit = atof(row[2]);
+            if (used + amount > limit) {
+                cout << "Exceeds credit limit. Available: ₹" << (limit - used) << "\n";
+            } else {
+                string upd = "UPDATE credit_cards SET used_amount = used_amount + " + to_string(amount)
+                           + ", last_payment_date = CURDATE() WHERE id = " + to_string(cardId);
+                if (executeQuery(conn, upd)) {
+                    insert_transaction(conn, customerId, "Credit Card Spend", amount, "Purchase via credit card");
+                    log_event(conn, "CreditCardUse", "Customer used credit card", customerId);
+                    cout << "✅ Purchase successful. Remaining limit: ₹" << (limit - used - amount) << "\n";
+                }
+            }
+            if (res) mysql_free_result(res);
+        }
+
+        else if (choice == 11) {
             cout << "Logged out.\n";
             log_event(conn, "Logout", "Customer logged out", customerId);
             break;
@@ -388,47 +590,153 @@ void customerLogin(MYSQL* conn) {
     }
 }
 
+
+
+void manage_credit_card_requests(MYSQL* conn) {
+    string q = "SELECT c.id, cust.name, c.card_number, c.issuer, c.credit_limit, c.status "
+               "FROM credit_cards c "
+               "JOIN customers cust ON c.customer_id = cust.id "
+               "WHERE c.status = 'Pending'";
+    if (mysql_query(conn, q.c_str()) != 0) {
+        cout << "❌ Error fetching credit card requests: " << mysql_error(conn) << endl;
+        return;
+    }
+
+    MYSQL_RES* res = mysql_store_result(conn);
+    if (!res || mysql_num_rows(res) == 0) {
+        cout << "✅ No pending credit card requests.\n";
+        if (res) mysql_free_result(res);
+        return;
+    }
+
+    MYSQL_ROW row;
+    cout << "\n=== Pending Credit Card Requests ===\n";
+    while ((row = mysql_fetch_row(res))) {
+        int id = stoi(row[0]);
+        string name = row[1];
+        string card = row[2];
+        string issuer = row[3];
+        double limit = atof(row[4]);
+        string status = row[5];
+        cout << "\n-------------------------------------\n";
+        cout << "Request ID: " << id << "\nCustomer: " << name
+             << "\nCard: " << mask_card_number(card)
+             << "\nIssuer: " << issuer
+             << "\nLimit: ₹" << limit
+             << "\nStatus: " << status << endl;
+
+        cout << "\nAction (1=Approve, 2=Reject, 0=Skip): ";
+        int act; cin >> act;
+        if (act == 1) {
+            string upd = "UPDATE credit_cards SET status='Approved', approved_by='A4' WHERE id=" + to_string(id);
+            if (executeQuery(conn, upd)) {
+                cout << "✅ Approved successfully.\n";
+                log_event(conn, "CreditCardApproved", "Credit card approved by A4", id);
+            }
+        } else if (act == 2) {
+            string upd = "UPDATE credit_cards SET status='Rejected', approved_by='A4' WHERE id=" + to_string(id);
+            if (executeQuery(conn, upd)) {
+                cout << "❌ Rejected successfully.\n";
+                log_event(conn, "CreditCardRejected", "Credit card rejected by A4", id);
+            }
+        } else {
+            cout << "Skipped.\n";
+        }
+    }
+    mysql_free_result(res);
+}
+
 /* ========== ADMIN FEATURES ========== */
 
 void adminMenu(MYSQL* conn, int adminId, const string &role) {
     int choice;
-    if (role == "A4") {
-        while (true) {
-            cout << "\n==== CREDIT CARD MANAGEMENT (Admin A4) ====\n1.View Pending 2.Approve/Block 3.View Customer Info 4.Logout\nChoose: ";
-            cin >> choice;
-            if (choice == 1) {
-                string q = "SELECT id, customer_id, card_number, credit_limit FROM credit_cards WHERE status='Pending' AND approved_by='A4'";
-                if (mysql_query(conn, q.c_str())==0) {
-                    MYSQL_RES* r = mysql_store_result(conn);
-                    MYSQL_ROW row;
-                    cout << "--Pending Credit Card Requests--\n";
-                    while ((row = mysql_fetch_row(r))) {
-                        cout << "ReqID:" << row[0] << " CustID:" << row[1] << " Card:" << row[2] << " Limit:₹" << row[3] << "\n";
+if (role == "A4") {
+    int ch;
+    do {
+        cout << "\n===== ADMIN A4 MENU =====\n";
+        cout << "1. View & Manage Credit Card Requests\n";
+        cout << "2. Block / Unblock Existing Credit Cards\n";
+        cout << "3. View All Credit Cards\n";
+        cout << "4. Logout\n";
+        cout << "Choose option: ";
+        cin >> ch;
+        switch (ch) {
+            case 1:
+                manage_credit_card_requests(conn);
+                break;
+
+            case 2: {
+                string q = "SELECT id, cust.name, c.card_number, c.status "
+                           "FROM credit_cards c "
+                           "JOIN customers cust ON c.customer_id = cust.id";
+                if (mysql_query(conn, q.c_str()) != 0) {
+                    cout << "Error: " << mysql_error(conn) << endl;
+                    break;
+                }
+                MYSQL_RES* res = mysql_store_result(conn);
+                if (!res || mysql_num_rows(res) == 0) {
+                    cout << "No cards found.\n";
+                    if (res) mysql_free_result(res);
+                    break;
+                }
+                MYSQL_ROW row;
+                while ((row = mysql_fetch_row(res))) {
+                    cout << "\nCard ID: " << row[0]
+                         << " | Customer: " << row[1]
+                         << " | Card: " << mask_card_number(row[2])
+                         << " | Status: " << row[3] << endl;
+                    cout << "Action (1=Block, 2=Unblock, 0=Skip): ";
+                    int act; cin >> act;
+                    if (act == 1) {
+                        string upd = "UPDATE credit_cards SET status='Blocked' WHERE id=" + string(row[0]);
+                        executeQuery(conn, upd);
+                        log_event(conn, "CreditCardBlocked", "Card blocked by A4", stoi(row[0]));
+                        cout << "✅ Card blocked.\n";
+                    } else if (act == 2) {
+                        string upd = "UPDATE credit_cards SET status='Approved' WHERE id=" + string(row[0]);
+                        executeQuery(conn, upd);
+                        log_event(conn, "CreditCardUnblocked", "Card unblocked by A4", stoi(row[0]));
+                        cout << "✅ Card unblocked.\n";
+                    } else {
+                        cout << "Skipped.\n";
                     }
-                    if (r) mysql_free_result(r);
                 }
-            } else if (choice == 2) {
-                int reqId; char d;
-                cout << "Enter Request ID: "; cin >> reqId;
-                cout << "Approve or Block? (A/B): "; cin >> d;
-                string status = (d=='A' || d=='a') ? "Approved" : "Blocked";
-                string update = "UPDATE credit_cards SET status='" + status + "', approval_time=NOW() WHERE id=" + to_string(reqId) + " AND approved_by='A4'";
-                if (executeQuery(conn, update)) cout << (status=="Approved" ? "Credit Card Approved.\n" : "Credit Card Blocked.\n");
-                else cout << "Failed to update.\n";
-            } else if (choice == 3) {
-                int cid; cout << "Customer ID: "; cin >> cid;
-                string q = "SELECT full_name, phone_number, email, balance FROM customers WHERE id=" + to_string(cid);
-                if (mysql_query(conn, q.c_str())==0) {
-                    MYSQL_RES* r = mysql_store_result(conn);
-                    MYSQL_ROW row = r ? mysql_fetch_row(r) : nullptr;
-                    if (row) cout << "Name:" << row[0] << " Phone:" << row[1] << " Email:" << row[2] << " Balance:₹" << row[3] << "\n";
-                    else cout << "Customer not found.\n";
-                    if (r) mysql_free_result(r);
+                mysql_free_result(res);
+                break;
+            }
+
+            case 3: {
+                string q = "SELECT c.id, cust.name, c.card_number, c.issuer, c.credit_limit, c.status "
+                           "FROM credit_cards c JOIN customers cust ON c.customer_id = cust.id";
+                if (mysql_query(conn, q.c_str()) != 0) {
+                    cout << "Error: " << mysql_error(conn) << endl;
+                    break;
                 }
-            } else if (choice == 4) { cout << "Logged out.\n"; break; }
-            else cout << "Invalid.\n";
+                MYSQL_RES* res = mysql_store_result(conn);
+                MYSQL_ROW row;
+                cout << "\n=== ALL CREDIT CARDS ===\n";
+                while ((row = mysql_fetch_row(res))) {
+                    cout << "\nID: " << row[0]
+                         << " | Customer: " << row[1]
+                         << " | Card: " << mask_card_number(row[2])
+                         << " | Issuer: " << row[3]
+                         << " | Limit: ₹" << row[4]
+                         << " | Status: " << row[5] << endl;
+                }
+                mysql_free_result(res);
+                break;
+            }
+
+            case 4:
+                cout << "Logging out...\n";
+                break;
+
+            default:
+                cout << "Invalid choice.\n";
         }
-    }
+    } while (ch != 4);
+}
+
     else if (role == "A5") {
         while (true) {
             cout << "\n==== ACCOUNT UNBLOCKING (Admin A5) ====\n1.View Blocked 2.Unblock Customer 3.View Logs 4.Logout\nChoose: ";

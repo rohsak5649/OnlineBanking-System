@@ -1,0 +1,14 @@
+# Build directories
+cmake-build-debug/
+build/
+.idea/
+*.o
+*.obj
+*.exe
+*.bin
+*.log
+*.ninja
+*.cache
+CMakeFiles/
+CMakeCache.txt
+
